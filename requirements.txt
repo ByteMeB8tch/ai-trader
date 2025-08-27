@@ -1,8 +1,8 @@
-pandas 
-numpy 
-yfinance==0.2.18
-alpaca-trade-api==2.3.0
-python-dotenv 
-matplotlib 
-pytz 
+pandas
+numpy
+yfinance==0.2.33 
+alpaca-trade-api==2.3.0 
+python-dotenv==1.0.0 
+requests==2.31.0 
+urllib3==1.26.18 
 websockets==10.4
