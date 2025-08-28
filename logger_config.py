@@ -5,8 +5,8 @@ def get_logger(name="ai_trader"):
     if logger.handlers: 
         return logger 
     logger.setLevel(logging.INFO) 
-    fmt = logging.Formatter("%%%(asctime)s | %%%(levelname)s | %%%(message)s") 
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s") 
     sh = logging.StreamHandler(sys.stdout) 
     sh.setFormatter(fmt) 
     logger.addHandler(sh) 
-    return logger 
+    return logger

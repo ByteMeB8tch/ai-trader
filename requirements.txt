@@ -6,3 +6,5 @@ python-dotenv==1.0.0
 requests==2.31.0 
 urllib3==1.26.18 
 websockets==10.4
+pandas-ta
+google-generativeai
