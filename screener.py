@@ -44,60 +44,44 @@ def get_latest_df_for_screener(symbol, limit=100):
         logger.error(f"Error fetching data for {symbol}: {e}")
         return None
 
-def screen_for_opportunities(symbols_to_scan):
-    """
-    Screens for potential trading opportunities from a list of symbols
-    and returns a sorted list of the best candidates based on technical score.
-    """
+def screen_for_opportunities(symbols_to_scan, timeframes=['1Min', '5Min', '15Min']):
     logger.info(f"Starting market screener for {len(symbols_to_scan)} symbols...")
+
     opportunities = []
 
     for symbol in symbols_to_scan:
-        df = get_latest_df_for_screener(symbol, limit=100)
-        if df is None or df.empty or len(df) < 50:
-            continue
-        
-        # Volume confirmation check
-        if df['Volume'].iloc[-1] < MIN_VOLUME_FOR_SCREENING:
-            continue
-            
-        # Add indicators
-        df = add_indicators(df)
-        df = df.dropna()
-        
-        if df.empty:
-            continue
-            
-        signal, score = compute_signal_and_score(df)
-        
-        # Get current data for additional filtering
-        current_data = df.iloc[-1]
-        
-        # Additional filters for better quality signals
-        is_quality_signal = True
-        
-        # Filter out low volatility stocks (ATR < 0.5% of price)
-        if current_data['ATR'] / current_data['Close'] < 0.005:
-            is_quality_signal = False
-            
-        # Filter out stocks with very wide Bollinger Bands (high volatility)
-        if current_data['BB_Width'] > 0.1:  # More than 10% width
-            is_quality_signal = False
-            
-        # Only consider buy signals for initial screening
-        if signal == 1 and score > 0 and is_quality_signal:
-            last_price = df['Close'].iloc[-1]
-            opportunities.append({
-                'symbol': symbol,
-                'signal': signal,
-                'score': score,
-                'last_price': last_price,
-                'rsi': current_data['RSI'],
-                'atr': current_data['ATR'],
-                'volume_ratio': current_data['Volume_Ratio']
-            })
+        for _ in timeframes:
+            df = get_latest_df_for_screener(symbol, limit=100)
+            if df is None or df.empty or len(df) < 50:
+                continue
+            if df['Volume'].iloc[-1] < MIN_VOLUME_FOR_SCREENING:
+                continue
 
-    # Sort opportunities by score in descending order
+            df = add_indicators(df).dropna()
+            if df.empty:
+                continue
+
+            signal, score = compute_signal_and_score(df)
+            current_data = df.iloc[-1]
+
+            is_quality_signal = True
+            if current_data['ATR'] / current_data['Close'] < 0.005:
+                is_quality_signal = False
+            if current_data['BB_Width'] > 0.1:
+                is_quality_signal = False
+
+            if signal == 1 and score > 0 and is_quality_signal:
+                last_price = df['Close'].iloc[-1]
+                opportunities.append({
+                    'symbol': symbol,
+                    'signal': signal,
+                    'score': score,
+                    'last_price': last_price,
+                    'rsi': current_data['RSI'],
+                    'atr': current_data['ATR'],
+                    'volume_ratio': current_data['Volume_Ratio'],
+                    'timeframe': _
+                })
+
     opportunities.sort(key=lambda x: x['score'], reverse=True)
-    
     return opportunities

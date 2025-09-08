@@ -1,9 +1,8 @@
 import pandas as pd
 import numpy as np
 
-def add_indicators(df):
-    """Adds multiple technical indicators to the DataFrame."""
-    # Existing SMAs
+def add_indicators(df, adx_period=14, cci_period=20, keltner_period=20, keltner_mult=2):
+    # Simple Moving Averages
     df['SMA9'] = df['Close'].rolling(window=9).mean()
     df['SMA20'] = df['Close'].rolling(window=20).mean()
 
@@ -20,7 +19,7 @@ def add_indicators(df):
     df['BB_Lower'] = df['BB_Middle'] - (bb_std * bb_std_dev)
     df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
 
-    # RSI (Relative Strength Index)
+    # RSI
     rsi_length = 14
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=rsi_length).mean()
@@ -28,18 +27,18 @@ def add_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    # MACD (Moving Average Convergence Divergence)
+    # MACD
     ema12 = df['Close'].ewm(span=12).mean()
     ema26 = df['Close'].ewm(span=26).mean()
     df['MACD'] = ema12 - ema26
     df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
     df['MACD_Histogram'] = df['MACD'] - df['MACD_Signal']
 
-    # Volume indicators
+    # Volume
     df['Volume_SMA20'] = df['Volume'].rolling(window=20).mean()
-    df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA20'].replace(0, 1) # Avoid division by zero
+    df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA20'].replace(0, 1)  # avoid div by zero
 
-    # ATR (Average True Range) for volatility measurement
+    # ATR
     high_low = df['High'] - df['Low']
     high_close = np.abs(df['High'] - df['Close'].shift())
     low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -50,23 +49,49 @@ def add_indicators(df):
     # Stochastic Oscillator
     low_14 = df['Low'].rolling(window=14).min()
     high_14 = df['High'].rolling(window=14).max()
-    df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14).replace(0, 1)) # Avoid division by zero
+    denom = (high_14 - low_14).replace(0, 1)
+    df['Stoch_K'] = 100 * ((df['Close'] - low_14) / denom)
     df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
 
-    # OBV (On-Balance Volume)
+    # OBV
     df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+
+    # ADX
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        np.abs(df['High'] - df['Close'].shift()),
+        np.abs(df['Low'] - df['Close'].shift())
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(window=adx_period).mean()
+    up_move = df['High'].diff()
+    down_move = df['Low'].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+    plus_di = 100 * pd.Series(plus_dm).rolling(window=adx_period).sum() / atr
+    minus_di = 100 * pd.Series(minus_dm).rolling(window=adx_period).sum() / atr
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1)
+    df['ADX'] = pd.Series(dx).rolling(window=adx_period).mean()
+
+    # CCI
+    tp = (df['High'] + df['Low'] + df['Close']) / 3
+    cci_denom = tp.rolling(window=cci_period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True).replace(0, 1)
+    df['CCI'] = (tp - tp.rolling(window=cci_period).mean()) / (0.015 * cci_denom)
+
+    # Keltner Channel
+    ema = df['Close'].ewm(span=keltner_period).mean()
+    kc_upper = ema + keltner_mult * df['ATR']
+    kc_lower = ema - keltner_mult * df['ATR']
+    df['KC_Upper'] = kc_upper
+    df['KC_Lower'] = kc_lower
+
     return df
 
+
 def compute_signal_and_score(df):
-    """
-    Computes a trading signal and profitability score based on multiple indicators.
-    Returns:
-    tuple: (signal, score) where signal is 1 (buy), 0 (sell), or -1 (hold),
-    and score is a float representing the potential profitability.
-    """
     df = add_indicators(df)
-    # Drop rows with NaN values
     df = df.dropna()
+
     if df.empty or len(df) < 2:
         return None, 0.0
 
@@ -75,77 +100,90 @@ def compute_signal_and_score(df):
 
     signal = -1
     score = 0.0
-
-    # Calculate a composite score based on multiple indicators
     indicator_score = 0
     max_possible_score = 0
 
-    # 1. SMA Crossover (weight: 30%)
+    # SMA cross
     max_possible_score += 30
     if previous_data['SMA9'] < previous_data['SMA20'] and current_data['SMA9'] > current_data['SMA20']:
         indicator_score += 30
     elif previous_data['SMA9'] > previous_data['SMA20'] and current_data['SMA9'] < current_data['SMA20']:
         indicator_score -= 30
 
-    # 2. MACD (weight: 20%)
+    # MACD cross
     max_possible_score += 20
     if current_data['MACD'] > current_data['MACD_Signal'] and previous_data['MACD'] <= previous_data['MACD_Signal']:
         indicator_score += 20
     elif current_data['MACD'] < current_data['MACD_Signal'] and previous_data['MACD'] >= previous_data['MACD_Signal']:
         indicator_score -= 20
 
-    # 3. RSI (weight: 15%)
+    # RSI levels
     max_possible_score += 15
-    if current_data['RSI'] < 30: # Oversold
+    if current_data['RSI'] < 30:
         indicator_score += 15
-    elif current_data['RSI'] > 70: # Overbought
+    elif current_data['RSI'] > 70:
         indicator_score -= 15
     elif 30 <= current_data['RSI'] <= 70:
-        # Neutral RSI adds nothing
-        max_possible_score -= 15 # Adjust max since neutral doesn't contribute
+        max_possible_score -= 15
 
-    # 4. Bollinger Band Position (weight: 15%)
+    # Bollinger Bands
     max_possible_score += 15
     bb_range = current_data['BB_Upper'] - current_data['BB_Lower']
-    bb_range = bb_range if bb_range != 0 else 1  # Prevent division by zero
+    bb_range = bb_range if bb_range != 0 else 1
     bb_position = (current_data['Close'] - current_data['BB_Lower']) / bb_range
-
-    if bb_position < 0.2: # Near lower band (potential buy)
+    if bb_position < 0.2:
         indicator_score += 15
-    elif bb_position > 0.8: # Near upper band (potential sell)
+    elif bb_position > 0.8:
         indicator_score -= 15
 
-    # 5. Volume confirmation (weight: 10%)
+    # Volume ratio
     max_possible_score += 10
-    if current_data['Volume_Ratio'] > 1.5: # High volume confirms move
-        if indicator_score > 0: # If other indicators are bullish
+    if current_data['Volume_Ratio'] > 1.5:
+        if indicator_score > 0:
             indicator_score += 10
-        elif indicator_score < 0: # If other indicators are bearish
+        elif indicator_score < 0:
             indicator_score -= 10
 
-    # 6. Stochastic (weight: 10%)
+    # Stochastic oscillator
     max_possible_score += 10
-    if current_data['Stoch_K'] < 20 and current_data['Stoch_D'] < 20: # Oversold
+    if current_data['Stoch_K'] < 20 and current_data['Stoch_D'] < 20:
         indicator_score += 10
-    elif current_data['Stoch_K'] > 80 and current_data['Stoch_D'] > 80: # Overbought
+    elif current_data['Stoch_K'] > 80 and current_data['Stoch_D'] > 80:
         indicator_score -= 10
 
-    # Determine final signal and score
-    if indicator_score >= 20: # Strong buy signal
+    # ADX and MACD trend confirmation
+    max_possible_score += 10
+    if current_data['ADX'] > 25:
+        indicator_score += 5
+    if current_data['MACD'] > current_data['MACD_Signal']:
+        indicator_score += 5
+
+    # CCI momentum indicator
+    max_possible_score += 10
+    if current_data['CCI'] > 100:
+        indicator_score += 10
+    elif current_data['CCI'] < -100:
+        indicator_score -= 10
+
+    # Keltner Channel breakout
+    max_possible_score += 10
+    if current_data['Close'] > current_data['KC_Upper']:
+        indicator_score += 10
+    elif current_data['Close'] < current_data['KC_Lower']:
+        indicator_score -= 10
+
+    # Determine signal and score with lowered threshold
+    if indicator_score >= 15:
         signal = 1
-        # Normalize score to 0-1 range
         score = min(1.0, max(0.0, indicator_score / max_possible_score))
-        # Adjust for how far price is from SMA20
         price_deviation = (current_data['Close'] - current_data['SMA20']) / current_data['SMA20']
         score = score * (1 + price_deviation) if price_deviation > 0 else score
-    elif indicator_score <= -20: # Strong sell signal
+    elif indicator_score <= -15:
         signal = 0
-        # Normalize score to 0-1 range
         score = min(1.0, max(0.0, abs(indicator_score) / max_possible_score))
-        # Adjust for how far price is from SMA20
         price_deviation = (current_data['SMA20'] - current_data['Close']) / current_data['SMA20']
         score = score * (1 + price_deviation) if price_deviation > 0 else score
-    else: # Hold signal
+    else:
         signal = -1
         score = 0.0
 

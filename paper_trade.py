@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from alpaca_trade_api.rest import REST
 from strategy import compute_signal_and_score
 from screener import screen_for_opportunities
-from news_analyzer import fetch_news_for_symbol, analyze_with_gemini
+from news_analyzer import fetch_news_for_symbol, analyze_with_gemini, analyze_with_perplexity
 from ml_predictor import train_model, predict_next_price_movement 
 from logger_config import get_logger
 
@@ -27,7 +27,7 @@ BASE_TAKE_PROFIT_PERCENT = float(os.getenv("BASE_TAKE_PROFIT_PERCENT", "2.0"))
 MIN_STOP_LOSS_PERCENT = float(os.getenv("MIN_STOP_LOSS_PERCENT", "1.0")) # Minimum stop-loss %
 MIN_TAKE_PROFIT_PERCENT = float(os.getenv("MIN_TAKE_PROFIT_PERCENT", "1.0")) # Minimum take-profit %
 
-BATCH_SIZE = 100 
+BATCH_SIZE = 50 
 SCREENING_POOL_SIZE = int(os.getenv("SCREENING_POOL_SIZE", "1000")) 
 TOP_CANDIDATES_COUNT = int(os.getenv("TOP_CANDIDATES_COUNT", "10")) 
 RISK_PER_TRADE_PERCENT = float(os.getenv("RISK_PER_TRADE_PERCENT", "1.0")) 
@@ -280,7 +280,7 @@ def main_loop():
     if not test_api_connection():
         logger.error("Cannot connect to Alpaca API. Check your .env file and API keys.")
         return
-
+    
     initialize_open_positions_metadata()
     all_symbols = get_all_active_assets()
     if not all_symbols:
@@ -288,6 +288,7 @@ def main_loop():
         return
 
     logger.info(f"Found {len(all_symbols)} tradable symbols. Starting scan in batches of {BATCH_SIZE}.")
+    
 
     global trained_ml_model
     logger.info("Fetching historical data to train ML model...")
@@ -399,56 +400,77 @@ def main_loop():
                                 else:
                                     logger.warning("ML model not trained. Skipping ML prediction.")
 
-                                if ml_prediction == 1 and ml_probability_of_up > 0.25:
-                                    news_articles = fetch_news_for_symbol(symbol)
-                                    recent_df = get_latest_df(symbol, limit=10)
-                                    gemini_analysis = analyze_with_gemini(symbol, news_articles, recent_df)
-                                    confidence = gemini_analysis.get('confidence', 0.0)
-                                    sentiment = gemini_analysis.get('sentiment', 'neutral')
-                                    suggested_sl = gemini_analysis.get('suggested_stop_loss_percent', BASE_STOP_LOSS_PERCENT)
-                                    suggested_tp = gemini_analysis.get('suggested_take_profit_percent', BASE_TAKE_PROFIT_PERCENT)
+                                if ml_prediction == 1 and ml_probability_of_up > 0.15:
+                                    # Fetch news and perform AI analysis
+                                    articles = fetch_news_for_symbol(symbol)
+                                    if not articles:
+                                        logger.info(f"No news articles for {symbol}, skipping.")
+                                        continue
 
-                                    if sentiment == 'Positive':
-                                        if confidence > 0.8:
-                                            trade_amount_multiplier = 2.0
-                                        elif confidence > 0.6:
-                                            trade_amount_multiplier = 1.0
-                                        elif confidence > 0.4:
-                                            trade_amount_multiplier = 0.5
-                                        else:
-                                            trade_amount_multiplier = 0.0
-                                    else:
-                                        trade_amount_multiplier = 0.0
+                                    recent_prices = get_latest_df(symbol, limit=10)
+                                    if recent_prices is None or recent_prices.empty:
+                                        logger.info(f"No recent prices for {symbol}, skipping.")
+                                        continue
+
+                                    # Prepare news text for Perplexity analysis
+                                    news_text = "\n".join(f"Headline: {a['headline']}\nSummary: {a['summary']}" for a in articles)
+
+                                    # Get analysis from both AI systems
+                                    gemini_result = analyze_with_gemini(symbol, articles, recent_prices)
+                                    perplexity_result = analyze_with_perplexity(news_text)
+
+                                    logger.info(f"{symbol} Gemini: Sentiment={gemini_result['sentiment']} Confidence={gemini_result['confidence']:.2f}")
+                                    logger.info(f"{symbol} Perplexity: Sentiment={perplexity_result['sentiment']} Confidence={perplexity_result['confidence']:.2f}")
+
+                                    # Combined decision logic
+                                    min_confidence = 0.3
+                                    buy_signal = False
+                                    max_confidence = max(gemini_result['confidence'], perplexity_result['confidence'])
                                     
-                                    if trade_amount_multiplier > 0:
-                                        desired_trade_value = POSITION_SIZE_USD * trade_amount_multiplier
-                                        account_info = get_account_info()
-                                        current_equity = float(account_info['equity'])
-                                        current_buying_power = float(account_info['buying_power'])
-                                        max_risk_amount_per_trade = current_equity * (RISK_PER_TRADE_PERCENT / 100)
-                                        final_trade_value = min(desired_trade_value, max_risk_amount_per_trade)
+                                    if (gemini_result['sentiment'] == 'Positive' and gemini_result['confidence'] >= min_confidence) or \
+                                       (perplexity_result['sentiment'] == 'Positive' and perplexity_result['confidence'] >= min_confidence):
+                                        buy_signal = True
 
-                                        if final_trade_value < last_price:
-                                            logger.warning(f"Calculated trade value ${final_trade_value:.2f} for {symbol} is less than last price ${last_price:.2f}. Skipping trade.")
-                                            continue
+                                    if buy_signal:
+                                        # Determine size based on confidence
+                                        if max_confidence > 0.75:
+                                            multiplier = 2.0
+                                        elif max_confidence > 0.5:
+                                            multiplier = 1.0
+                                        else:
+                                            multiplier = 0.3
 
-                                        qty_to_trade = max(1, int(final_trade_value / last_price))
+                                        if multiplier > 0:
+                                            account = get_account_info()
+                                            max_risk_amount = account['equity'] * RISK_PER_TRADE_PERCENT / 100
+                                            desired_value = min(multiplier * POSITION_SIZE_USD, max_risk_amount, account['buying_power'])
+                                            price = recent_prices['Close'].iloc[-1]
+                                            qty = max(1, int(desired_value / price))
 
-                                        if (qty_to_trade * last_price) > current_buying_power:
-                                            logger.warning(f"Insufficient buying power to place order for {symbol}. Needed: ${qty_to_trade * last_price:.2f}, Available: ${current_buying_power:.2f}. Skipping trade.")
-                                            continue
+                                            if qty * price > account['buying_power']:
+                                                logger.warning(f"Not enough buying power for {symbol} to buy {qty} shares.")
+                                                continue
 
-                                        open_positions_metadata[symbol] = {
-                                            'entry_price': last_price,
-                                            'dynamic_sl_percent': suggested_sl,
-                                            'dynamic_tp_percent': suggested_tp,
-                                            'qty': qty_to_trade
-                                        }
-                                        safe_place_order(symbol, qty_to_trade, 'buy', suggested_sl, suggested_tp)
+                                            # Use Gemini's suggested risk parameters or fallback defaults
+                                            sl = max(gemini_result.get('suggested_stop_loss_percent', MIN_STOP_LOSS_PERCENT), MIN_STOP_LOSS_PERCENT)
+                                            tp = max(gemini_result.get('suggested_take_profit_percent', MIN_TAKE_PROFIT_PERCENT), MIN_TAKE_PROFIT_PERCENT)
+
+                                            open_positions_metadata[symbol] = {
+                                                'entry_price': price,
+                                                'qty': qty,
+                                                'dynamic_sl': sl,
+                                                'dynamic_tp': tp
+                                            }
+
+                                            safe_place_order(symbol, qty, 'buy', sl, tp)
+                                            logger.info(f"Placed buy order for {symbol}: qty={qty}, SL={sl}%, TP={tp}%")
+                                        else:
+                                            logger.info(f"Insufficient confidence for {symbol}. Skipping trade.")
                                     else:
-                                        logger.info(f"Insufficient confidence or non-positive sentiment from Gemini for {symbol}. Skipping trade.")
+                                        logger.info(f"No buy signal for {symbol} based on combined sentiment analysis.")
                                 else:
-                                    logger.info(f"ML prediction not strong enough for {symbol}. Skipping Gemini analysis and trade.")
+                                    logger.info(f"ML predictions do not support buying for {symbol}.")
+
                             elif technical_signal == 0 and current_qty > 0:
                                 logger.info(f"Technical sell signal for {symbol}, but position is open. Relying on dynamic SL/TP or market close.")
                             else:
