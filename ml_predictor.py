@@ -14,31 +14,30 @@ def create_features_and_target(df):
     Target: 1 if next minute's close price is higher, 0 otherwise.
     """
     df_copy = df.copy()
-
-    df_copy['SMA9'] = df_copy['Close'].rolling(window=9).mean()
-    df_copy['SMA20'] = df_copy['Close'].rolling(window=20).mean()
     
-    # Calculate RSI more robustly
-    delta = df_copy['Close'].diff(1)
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-
-    avg_gain = gain.ewm(span=14, adjust=False).mean()
-    avg_loss = loss.ewm(span=14, adjust=False).mean()
-
-    rs = avg_gain / avg_loss
-    df_copy['RSI'] = 100 - (100 / (1 + rs)) 
+    # Calculate all the indicators
+    from strategy import add_indicators
+    df_copy = add_indicators(df_copy)
     
-    df_copy['RSI'] = df_copy['RSI'].replace([np.inf, -np.inf], np.nan)
-
-    df_copy['Volume_Change'] = df_copy['Volume'].pct_change()
+    # Create additional features
     df_copy['Price_Change'] = df_copy['Close'].pct_change()
-
+    df_copy['High_Low_Ratio'] = (df_copy['High'] - df_copy['Low']) / df_copy['Close'].replace(0, 1)
+    
+    # Target: price will go up in the next period
     df_copy['Target'] = (df_copy['Close'].shift(-1) > df_copy['Close']).astype(int)
-
+    
+    # Select features for ML
+    feature_columns = [
+        'SMA9', 'SMA20', 'EMA12', 'EMA26', 
+        'BB_Middle', 'BB_Upper', 'BB_Lower', 'BB_Width',
+        'RSI', 'MACD', 'MACD_Signal', 'MACD_Histogram',
+        'Volume_Ratio', 'ATR', 'Stoch_K', 'Stoch_D',
+        'Price_Change', 'High_Low_Ratio', 'OBV'
+    ]
+    
     df_copy = df_copy.dropna()
     
-    features = df_copy[['SMA9', 'SMA20', 'RSI', 'Volume_Change', 'Price_Change']]
+    features = df_copy[feature_columns]
     target = df_copy['Target']
     
     return features, target
