@@ -276,22 +276,24 @@ def initialize_open_positions_metadata():
 
 def main_loop():
     logger.info("Starting paper trading loop")
-    
+
     if not test_api_connection():
         logger.error("Cannot connect to Alpaca API. Check your .env file and API keys.")
         return
-    
+
     initialize_open_positions_metadata()
     all_symbols = get_all_active_assets()
+
     if not all_symbols:
         logger.error("No tradable assets found. Exiting.")
         return
 
     logger.info(f"Found {len(all_symbols)} tradable symbols. Starting scan in batches of {BATCH_SIZE}.")
-    
 
     global trained_ml_model
+
     logger.info("Fetching historical data to train ML model...")
+
     ml_training_symbol = 'SPY'
     historical_df_for_ml = get_latest_df(ml_training_symbol, limit=ML_TRAINING_DATA_LIMIT)
     if historical_df_for_ml is not None and not historical_df_for_ml.empty:
@@ -302,6 +304,11 @@ def main_loop():
             logger.warning("ML model training failed. ML predictions will be skipped.")
     else:
         logger.warning("Could not fetch historical data for ML model training. ML predictions will be skipped.")
+
+    risk_multiplier = 1.0
+    max_multiplier = 5.0
+    cycles_without_trade = 0
+    no_trade_threshold = 3  # Increase risk after this many cycles of no trades
 
     while True:
         try:
@@ -324,18 +331,14 @@ def main_loop():
                     for pos in positions:
                         symbol = pos.symbol
                         df_current = get_latest_df(symbol, limit=10)
-                        
                         if df_current is not None and not df_current.empty:
                             current_price = float(df_current['Close'].iloc[-1])
                             pos_meta = open_positions_metadata.get(symbol, {})
                             entry_price = pos_meta.get('entry_price', float(pos.avg_entry_price))
                             current_stop_loss_threshold = max(pos_meta.get('dynamic_sl_percent', BASE_STOP_LOSS_PERCENT), MIN_STOP_LOSS_PERCENT)
                             current_take_profit_threshold = max(pos_meta.get('dynamic_tp_percent', BASE_TAKE_PROFIT_PERCENT), MIN_TAKE_PROFIT_PERCENT)
-
                             unrealized_pl_percent = ((current_price - entry_price) / entry_price) * 100
-
                             logger.info(f"Monitoring {symbol} (Held). P/L: {unrealized_pl_percent:.2f}% (SL: {-current_stop_loss_threshold:.2f}%, TP: {current_take_profit_threshold:.2f}%)")
-
                             if unrealized_pl_percent < -current_stop_loss_threshold:
                                 logger.warning(f"Stop-loss triggered for {symbol}. P/L: {unrealized_pl_percent:.2f}% - Selling.")
                                 positions_to_close.append(pos)
@@ -348,7 +351,6 @@ def main_loop():
                                 gemini_analysis = analyze_with_gemini(symbol, news_articles, df_current)
                                 confidence = gemini_analysis.get('confidence', 0.0)
                                 sentiment = gemini_analysis.get('sentiment', 'neutral')
-
                                 if sentiment == 'Negative' or (sentiment == 'Neutral' and confidence < 0.5):
                                     logger.warning(f"Gemini suggests selling {symbol} (Sentiment: {sentiment}, Confidence: {confidence:.2f}). Selling position.")
                                     positions_to_close.append(pos)
@@ -366,14 +368,15 @@ def main_loop():
 
                 import random
                 random.shuffle(all_symbols)
-
                 symbols_to_screen_this_cycle = all_symbols[:SCREENING_POOL_SIZE]
+
+                trades_executed_this_cycle = 0
 
                 for i in range(0, len(symbols_to_screen_this_cycle), BATCH_SIZE):
                     batch = symbols_to_screen_this_cycle[i:i + BATCH_SIZE]
                     logger.info(f"Screening batch {int(i/BATCH_SIZE) + 1}/{int(len(symbols_to_screen_this_cycle)/BATCH_SIZE) + 1} for {len(batch)} symbols...")
-                    
                     opportunities = screen_for_opportunities(batch)
+
                     if opportunities:
                         top_candidates = opportunities[:TOP_CANDIDATES_COUNT]
                         logger.info(f"Found {len(top_candidates)} top technical candidates in this batch for deeper analysis.")
@@ -383,13 +386,12 @@ def main_loop():
                             technical_signal = candidate['signal']
                             technical_score = candidate['score']
                             last_price = candidate['last_price']
-                            
                             current_qty = get_position_qty(symbol)
                             if technical_signal == 1 and current_qty == 0:
                                 logger.info(f"Performing deep analysis for NEW BUY candidate {symbol} (Technical Score: {technical_score:.4f})...")
-                                
                                 ml_prediction = -1
                                 ml_probability_of_up = 0.0
+
                                 if trained_ml_model:
                                     current_df_for_ml = get_latest_df(symbol, limit=ML_TRAINING_DATA_LIMIT)
                                     if current_df_for_ml is not None and not current_df_for_ml.empty and len(current_df_for_ml) >= 20:
@@ -401,83 +403,70 @@ def main_loop():
                                     logger.warning("ML model not trained. Skipping ML prediction.")
 
                                 if ml_prediction == 1 and ml_probability_of_up > 0.15:
-                                    # Fetch news and perform AI analysis
                                     articles = fetch_news_for_symbol(symbol)
                                     if not articles:
                                         logger.info(f"No news articles for {symbol}, skipping.")
                                         continue
-
                                     recent_prices = get_latest_df(symbol, limit=10)
                                     if recent_prices is None or recent_prices.empty:
                                         logger.info(f"No recent prices for {symbol}, skipping.")
                                         continue
-
-                                    # Prepare news text for Perplexity analysis
                                     news_text = "\n".join(f"Headline: {a['headline']}\nSummary: {a['summary']}" for a in articles)
-
-                                    # Get analysis from both AI systems
                                     gemini_result = analyze_with_gemini(symbol, articles, recent_prices)
                                     perplexity_result = analyze_with_perplexity(news_text)
-
                                     logger.info(f"{symbol} Gemini: Sentiment={gemini_result['sentiment']} Confidence={gemini_result['confidence']:.2f}")
                                     logger.info(f"{symbol} Perplexity: Sentiment={perplexity_result['sentiment']} Confidence={perplexity_result['confidence']:.2f}")
 
-                                    # Combined decision logic
                                     min_confidence = 0.3
-                                    buy_signal = False
+                                    buy_signal = (gemini_result['sentiment'] == 'Positive' and gemini_result['confidence'] >= min_confidence) or \
+                                                 (perplexity_result['sentiment'] == 'Positive' and perplexity_result['confidence'] >= min_confidence)
                                     max_confidence = max(gemini_result['confidence'], perplexity_result['confidence'])
-                                    
-                                    if (gemini_result['sentiment'] == 'Positive' and gemini_result['confidence'] >= min_confidence) or \
-                                       (perplexity_result['sentiment'] == 'Positive' and perplexity_result['confidence'] >= min_confidence):
-                                        buy_signal = True
 
                                     if buy_signal:
-                                        # Determine size based on confidence
-                                        if max_confidence > 0.75:
-                                            multiplier = 2.0
-                                        elif max_confidence > 0.5:
-                                            multiplier = 1.0
-                                        else:
-                                            multiplier = 0.3
+                                        # Increase trade size by multiplier during inactivity
+                                        account = get_account_info()
+                                        price = recent_prices['Close'].iloc[-1]
+                                        max_risk_amount = account['equity'] * RISK_PER_TRADE_PERCENT / 100
+                                        desired_value = min(risk_multiplier * POSITION_SIZE_USD, max_risk_amount, account['buying_power'])
+                                        qty = max(1, int(desired_value / price))
+                                        if qty * price > account['buying_power']:
+                                            logger.warning(f"Not enough buying power for {symbol} to buy {qty} shares.")
+                                            continue
 
-                                        if multiplier > 0:
-                                            account = get_account_info()
-                                            max_risk_amount = account['equity'] * RISK_PER_TRADE_PERCENT / 100
-                                            desired_value = min(multiplier * POSITION_SIZE_USD, max_risk_amount, account['buying_power'])
-                                            price = recent_prices['Close'].iloc[-1]
-                                            qty = max(1, int(desired_value / price))
+                                        sl = max(gemini_result.get('suggested_stop_loss_percent', MIN_STOP_LOSS_PERCENT), MIN_STOP_LOSS_PERCENT)
+                                        tp = max(gemini_result.get('suggested_take_profit_percent', MIN_TAKE_PROFIT_PERCENT), MIN_TAKE_PROFIT_PERCENT)
+                                        open_positions_metadata[symbol] = {
+                                            'entry_price': price,
+                                            'qty': qty,
+                                            'dynamic_sl': sl,
+                                            'dynamic_tp': tp
+                                        }
 
-                                            if qty * price > account['buying_power']:
-                                                logger.warning(f"Not enough buying power for {symbol} to buy {qty} shares.")
-                                                continue
-
-                                            # Use Gemini's suggested risk parameters or fallback defaults
-                                            sl = max(gemini_result.get('suggested_stop_loss_percent', MIN_STOP_LOSS_PERCENT), MIN_STOP_LOSS_PERCENT)
-                                            tp = max(gemini_result.get('suggested_take_profit_percent', MIN_TAKE_PROFIT_PERCENT), MIN_TAKE_PROFIT_PERCENT)
-
-                                            open_positions_metadata[symbol] = {
-                                                'entry_price': price,
-                                                'qty': qty,
-                                                'dynamic_sl': sl,
-                                                'dynamic_tp': tp
-                                            }
-
-                                            safe_place_order(symbol, qty, 'buy', sl, tp)
-                                            logger.info(f"Placed buy order for {symbol}: qty={qty}, SL={sl}%, TP={tp}%")
-                                        else:
-                                            logger.info(f"Insufficient confidence for {symbol}. Skipping trade.")
+                                        safe_place_order(symbol, qty, 'buy', sl, tp)
+                                        logger.info(f"Placed buy order for {symbol}: qty={qty}, SL={sl}%, TP={tp}% (risk_multiplier={risk_multiplier:.2f})")
+                                        trades_executed_this_cycle += 1
                                     else:
-                                        logger.info(f"No buy signal for {symbol} based on combined sentiment analysis.")
+                                        logger.info(f"Insufficient confidence for {symbol}. Skipping trade.")
                                 else:
                                     logger.info(f"ML predictions do not support buying for {symbol}.")
-
                             elif technical_signal == 0 and current_qty > 0:
                                 logger.info(f"Technical sell signal for {symbol}, but position is open. Relying on dynamic SL/TP or market close.")
                             else:
                                 logger.info(f"No new buy signal for {symbol} or position already open.")
                     else:
                         logger.info("No technically profitable opportunities found in this batch.")
-                
+
+                # Risk escalation logic
+                if trades_executed_this_cycle == 0:
+                    cycles_without_trade += 1
+                    if cycles_without_trade >= no_trade_threshold and risk_multiplier < max_multiplier:
+                        risk_multiplier *= 1.3
+                        risk_multiplier = min(risk_multiplier, max_multiplier)
+                        logger.info(f"No trades for {cycles_without_trade} cycles, increasing risk multiplier to {risk_multiplier:.2f}")
+                else:
+                    cycles_without_trade = 0
+                    risk_multiplier = 1.0
+
                 logger.info(f"Completed a full market scan cycle. Next check in {POLL_INTERVAL_SECONDS} seconds.")
                 time.sleep(POLL_INTERVAL_SECONDS)
             else:
