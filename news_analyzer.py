@@ -217,3 +217,14 @@ def analyze_news_for_symbol(symbol, recent_df, risk_multiplier=1.0):
     }
     logger.info(f"Completed news analysis for {symbol}: Sentiment={combined_sentiment}, Confidence={combined_confidence:.2f}")
     return analysis_result
+def analyze_news_for_symbols(symbols, recent_data_dict, risk_multiplier=1.0):
+    results = []
+    for symbol in symbols:
+        recent_df = recent_data_dict.get(symbol)
+        if recent_df is None or recent_df.empty:
+            logger.warning(f"No recent data available for {symbol}. Skipping news analysis.")
+            continue
+        analysis = analyze_news_for_symbol(symbol, recent_df, risk_multiplier)
+        if analysis:
+            results.append(analysis)
+    return results
