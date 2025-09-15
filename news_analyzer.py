@@ -169,14 +169,21 @@ def analyze_with_perplexity(text, risk_multiplier=1.0):
             "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
             "Content-Type": "application/json"
         }
+        messages = [
+            {"role": "system", "content": caution_msg},
+            {"role": "user", "content": f"Analyze the sentiment of the following stock news for trading purposes as Positive, Negative, or Neutral:\n{text}"}
+        ]
         payload = {
-            "query": f"{caution_msg}\nAnalyze the sentiment of the following stock news for trading purposes as Positive, Negative, or Neutral:\n{text}",
+            "model": "sonar-small-online",  # Updated to permitted model from docs
+            "messages": messages,
             "max_tokens": 150
         }
-        response = requests.post("https://api.perplexity.ai/v1/answers", headers=headers, json=payload, timeout=15)
-        response.raise_for_status()
+        response = requests.post("https://api.perplexity.ai/chat/completions", headers=headers, json=payload, timeout=15)
+        if response.status_code != 200:
+            logger.error(f"Perplexity API call failed: {response.status_code} {response.reason}. Payload: {json.dumps(payload)}. Response: {response.text}")
+            return {'sentiment': 'neutral', 'confidence': 0.0, 'rationale': f'Perplexity call failed: {response.status_code} {response.reason}'}
         result = response.json()
-        answer_text = result.get("answer", "").lower()
+        answer_text = result.get("choices", [{}])[0].get("message", {}).get("content", "").lower()
         sentiment = "neutral"
         if "positive" in answer_text:
             sentiment = "Positive"
@@ -189,7 +196,7 @@ def analyze_with_perplexity(text, risk_multiplier=1.0):
             "rationale": "Derived from Perplexity API"
         }
     except Exception as e:
-        logger.error(f"Perplexity API call failed: {e}")
+        logger.error(f"Perplexity API call failed: {e}. Payload: {json.dumps(payload)}")
         return {'sentiment': 'neutral', 'confidence': 0.0, 'rationale': f'Perplexity call failed: {e}'}
 def analyze_news_for_symbol(symbol, recent_df, risk_multiplier=1.0):
     articles = fetch_news_for_symbol(symbol, limit=5)

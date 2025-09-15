@@ -180,6 +180,10 @@ def initialize_open_positions_metadata():
     except Exception as e:
         logger.error(f"Error initializing open positions metadata: {e}")
 
+def close_all_positions_at_ist_time():
+    # Stub implementation: does nothing for now
+    logger.info("close_all_positions_at_ist_time called (stub)")
+
 def main_loop():
     logger.info("Starting paper trading loop")
     if not test_api_connection():
@@ -187,17 +191,19 @@ def main_loop():
         return
 
     initialize_open_positions_metadata()
+
     all_symbols = get_all_active_assets()
     if not all_symbols:
         logger.error("No tradable assets found. Exiting.")
         return
+
     logger.info(f"Found {len(all_symbols)} tradable symbols. Starting scan in batches of {BATCH_SIZE}.")
 
     global trained_ml_model
-
     logger.info("Fetching historical data to train ML model...")
     ml_training_symbol = 'SPY'
     historical_df_for_ml = get_latest_df(ml_training_symbol, limit=ML_TRAINING_DATA_LIMIT)
+
     if historical_df_for_ml is not None and not historical_df_for_ml.empty:
         trained_ml_model = train_model(historical_df_for_ml)
         if trained_ml_model:
@@ -224,164 +230,83 @@ def main_loop():
                     time.sleep(300)
                     continue
 
-                max_risk_amount_per_trade = current_equity * (RISK_PER_TRADE_PERCENT / 100)
-                logger.info(f"Current Equity: ${current_equity:.2f}, Max Risk per Trade: ${max_risk_amount_per_trade:.2f}")
+                max_risk_amount = current_equity * (RISK_PER_TRADE_PERCENT / 100)
+                logger.info(f"Current Equity: ${current_equity:.2f}, Max Risk per Trade: ${max_risk_amount:.2f}")
 
-                # Close positions exceeding their dynamic SL or TP
-                positions_to_close = []
-                try:
-                    positions = api.list_positions()
-                    for pos in positions:
-                        symbol = pos.symbol
-                        df_current = get_latest_df(symbol, limit=10)
-                        if df_current is not None and not df_current.empty:
-                            current_price = float(df_current['Close'].iloc[-1])
-                            pos_meta = open_positions_metadata.get(symbol, {})
-                            entry_price = pos_meta.get('entry_price', float(pos.avg_entry_price))
-                            current_sl = max(pos_meta.get('dynamic_sl_percent', BASE_STOP_LOSS_PERCENT), MIN_STOP_LOSS_PERCENT)
-                            current_tp = max(pos_meta.get('dynamic_tp_percent', BASE_TAKE_PROFIT_PERCENT), MIN_TAKE_PROFIT_PERCENT)
-                            unrealized_pl_pct = ((current_price - entry_price) / entry_price) * 100
-
-                            logger.info(f"Monitoring {symbol} (Held). P/L: {unrealized_pl_pct:.2f}%, SL threshold: -{current_sl:.2f}%, TP threshold: {current_tp:.2f}%")
-
-                            if unrealized_pl_pct < -current_sl:
-                                logger.warning(f"Stop-loss triggered for {symbol}. Selling position.")
-                                positions_to_close.append(pos)
-                            elif unrealized_pl_pct > current_tp:
-                                logger.info(f"Take-profit triggered for {symbol}. Selling position.")
-                                positions_to_close.append(pos)
-                            else:
-                                logger.info(f"Checking hold/sell advice from Gemini for {symbol} position...")
-                                news_articles = fetch_news_for_symbol(symbol)
-                                gemini_analysis = analyze_with_gemini(symbol, news_articles, df_current)
-                                if gemini_analysis['sentiment'] == 'Negative' or (gemini_analysis['sentiment'] == 'Neutral' and gemini_analysis['confidence'] < 0.5):
-                                    logger.warning(f"Gemini suggests selling {symbol}. Selling position.")
-                                    positions_to_close.append(pos)
-                        else:
-                            logger.warning(f"Price data unavailable for {symbol}. Cannot monitor position.")
-
-                except Exception as e:
-                    logger.error(f"Error checking held positions: {e}")
-
-                for pos in positions_to_close:
-                    safe_place_order(pos.symbol, pos.qty, 'sell',
-                                     pos_meta.get('dynamic_sl_percent', BASE_STOP_LOSS_PERCENT),
-                                     pos_meta.get('dynamic_tp_percent', BASE_TAKE_PROFIT_PERCENT))
-                    if pos.symbol in open_positions_metadata:
-                        del open_positions_metadata[pos.symbol]
-
-                # Close all positions before 11 PM IST
-                # [You can keep your close_all_positions_at_ist_time() call here if implemented]
+                close_all_positions_at_ist_time()
 
                 import random
                 random.shuffle(all_symbols)
                 symbols_to_screen = all_symbols[:SCREENING_POOL_SIZE]
 
-                trades_this_cycle = 0
+                trades_executed = 0
 
                 for i in range(0, len(symbols_to_screen), BATCH_SIZE):
                     batch = symbols_to_screen[i:i + BATCH_SIZE]
-                    logger.info(f"Screening batch {int(i/BATCH_SIZE + 1)} / {int(len(symbols_to_screen)/BATCH_SIZE + 1)} for {len(batch)} symbols...")
+                    logger.info(f"Scanning batch {int(i / BATCH_SIZE) + 1}/{int(len(symbols_to_screen) / BATCH_SIZE) + 1} for {len(batch)} symbols...")
+
                     opportunities = screen_for_opportunities(batch)
                     if not opportunities:
                         continue
 
-                    # Increase number of top candidates analyzed for AI (can be tweaked)
-                    top_candidates = opportunities[:TOP_CANDIDATES_COUNT * 3]
+                    # Select the best candidate (highest score)
+                    try:
+                        best_candidate = max(opportunities, key=lambda x: x['score'])
+                    except Exception as e:
+                        logger.error(f"Error selecting best candidate from opportunities: {e}. Opportunities: {opportunities}")
+                        continue
+                    symbol = best_candidate['symbol']
+                    technical_signal = best_candidate['signal']
+                    technical_score = best_candidate['score']
+                    last_price = best_candidate['last_price']
 
-                    for candidate in top_candidates:
-                        symbol = candidate['symbol']
-                        technical_signal = candidate['signal']
-                        current_qty = get_position_qty(symbol)
+                    # Further check with Gemini, Perplexity, and news
+                    articles = fetch_news_for_symbol(symbol)
+                    recent_df = get_latest_df(symbol, limit=20)
+                    gemini_result = analyze_with_gemini(symbol, articles, recent_df)
+                    news_text = "\n".join([f"Headline: {a['headline']}\nSummary: {a['summary']}" for a in articles])
+                    perplexity_result = analyze_with_perplexity(news_text)
+                    news_result = analyze_news_for_symbol(symbol, recent_df)
 
-                        if technical_signal == 1 and current_qty == 0:
-                            logger.info(f"Analyzing new BUY candidate {symbol}...")
+                    gemini_ok = gemini_result.get('confidence', 0) > 0.5 and gemini_result.get('sentiment', '').lower() == 'positive'
+                    perplexity_ok = perplexity_result.get('confidence', 0) > 0.5 and perplexity_result.get('sentiment', '').lower() == 'positive'
+                    news_ok = news_result and news_result.get('confidence', 0) > 0.5 and news_result.get('sentiment', '').lower() == 'positive'
 
-                            ml_pred = -1
-                            ml_prob_up = 0.0
-                            if trained_ml_model:
-                                current_df_ml = get_latest_df(symbol, limit=ML_TRAINING_DATA_LIMIT)
-                                if current_df_ml is not None and not current_df_ml.empty and len(current_df_ml) >= 20:
-                                    ml_pred, ml_prob_up = predict_next_price_movement(trained_ml_model, current_df_ml)
-                                    logger.info(f"ML prediction for {symbol}: {ml_pred} prob_up: {ml_prob_up:.2f}")
-                                else:
-                                    logger.warning(f"Insufficient ML data for {symbol}. Skipping ML prediction.")
-                            else:
-                                logger.warning("ML model not trained yet.")
+                    if gemini_ok and perplexity_ok and news_ok:
+                        account = get_account_info()
+                        price = last_price if last_price > 0 else 1.0
+                        qty = 1  # Always buy 1 share for testing
+                        sl = gemini_result.get('suggested_stop_loss_percent', BASE_STOP_LOSS_PERCENT)
+                        tp = gemini_result.get('suggested_take_profit_percent', BASE_TAKE_PROFIT_PERCENT)
+                        open_positions_metadata[symbol] = {
+                            'entry_price': price,
+                            'qty': qty,
+                            'dynamic_sl': sl,
+                            'dynamic_tp': tp
+                        }
+                        safe_place_order(symbol, qty, 'buy', sl, tp)
+                        logger.info(f"Placed buy order for {symbol}: qty={qty}, SL={sl}%, TP={tp}% (BEST TRADE WITH NEWS/GEMINI/PERPLEXITY)")
+                        trades_executed += 1
+                    else:
+                        logger.info(f"Skipped {symbol} due to news/Gemini/Perplexity filter.")
 
-                            if ml_pred == 1 and ml_prob_up > 0.15:
-                                analysis = analyze_news_for_symbol(symbol, get_latest_df(symbol, limit=10), risk_multiplier)
-                                if analysis is None:
-                                    logger.info(f"No news analysis for {symbol}, skipping.")
-                                    continue
-
-                                conf = analysis['confidence']
-                                senti = analysis['sentiment']
-                                min_conf = 0.3 * (1 + (risk_multiplier -1) * 0.5)
-
-                                if senti == "Positive" and conf >= min_conf:
-                                    account = get_account_info()
-                                    base_risk = account['equity'] * (RISK_PER_TRADE_PERCENT / 100)
-                                    size_factor = 0.3
-                                    if conf >= 0.75:
-                                        size_factor = 2.0
-                                    elif conf >= 0.5:
-                                        size_factor = 1.0
-
-                                    size_factor *= risk_multiplier
-                                    desired_value = min(size_factor * POSITION_SIZE_USD, base_risk * size_factor, account['buying_power'])
-                                    price = get_latest_df(symbol, limit=1)['Close'].iloc[-1]
-
-                                    qty = max(1, int(desired_value / price))
-
-                                    if qty * price > account['buying_power']:
-                                        logger.warning(f"Not enough buying power for {symbol} to buy {qty} shares.")
-                                        continue
-
-                                    sl = max(analysis.get('stop_loss', MIN_STOP_LOSS_PERCENT), MIN_STOP_LOSS_PERCENT)
-                                    tp = max(analysis.get('take_profit', MIN_TAKE_PROFIT_PERCENT), MIN_TAKE_PROFIT_PERCENT)
-
-                                    open_positions_metadata[symbol] = {
-                                        'entry_price': price,
-                                        'qty': qty,
-                                        'dynamic_sl': sl,
-                                        'dynamic_tp': tp
-                                    }
-
-                                    safe_place_order(symbol, qty, 'buy', sl, tp)
-                                    logger.info(f"Placed buy order for {symbol}: qty={qty}, SL={sl}%, TP={tp}% with risk multiplier {risk_multiplier:.2f}")
-                                    trades_this_cycle += 1
-                                else:
-                                    logger.info(f"Insufficient AI confidence or neutral/negative sentiment for {symbol}, skipping buy.")
-                            else:
-                                logger.info(f"ML predictions do not support buying for {symbol}.")
-
-                        elif technical_signal == 0 and current_qty > 0:
-                            logger.info(f"Technical sell signal for {symbol} but position open; rely on dynamic SL/TP or market close.")
-
-                        else:
-                            logger.info(f"No new buy signal for {symbol} or already holds position.")
-
-                # Risk escalation logic
-                if trades_this_cycle == 0:
+                # Risk escalation
+                if trades_executed == 0:
                     cycles_without_trade += 1
                     if cycles_without_trade >= no_trade_threshold and risk_multiplier < max_multiplier:
-                        risk_multiplier = min(risk_multiplier * 1.3, max_multiplier)
-                        logger.info(f"No trades for {cycles_without_trade} cycles, increasing risk multiplier to {risk_multiplier:.2f}")
+                        risk_multiplier = min(max_multiplier, risk_multiplier * 1.3)
+                        logger.info(f"No trades for {cycles_without_trade} cycles, increased risk multiplier to {risk_multiplier:.2f}")
                 else:
                     cycles_without_trade = 0
-                    if risk_multiplier != 1.0:
-                        logger.info("Resetting risk multiplier to 1.0 after trades executed.")
                     risk_multiplier = 1.0
 
-                logger.info(f"Completed market scan cycle. Next check in {POLL_INTERVAL_SECONDS} seconds.")
+                logger.info(f"Completed a full scan cycle. Next scan in {POLL_INTERVAL_SECONDS} seconds.")
                 time.sleep(POLL_INTERVAL_SECONDS)
             else:
-                logger.info("Market closed. Waiting 15 minutes before next check.")
+                logger.info("Market closed. Waiting 15 minutes to reopen check.")
                 time.sleep(900)
-
         except Exception as e:
-            logger.exception(f"Error in main loop: {e}. Sleeping 5 minutes before retry.")
+            logger.exception("Error in main loop, sleeping 5 minutes before retry.")
             time.sleep(300)
 
 if __name__ == "__main__":
